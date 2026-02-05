@@ -84,7 +84,7 @@ class ChangeHandler(FileSystemEventHandler):
         if event.is_directory: return
         
         filename = os.path.basename(event.src_path)
-        if filename in IGNORE_FILES: return
+        if filename in IGNORE_FILES or filename.endswith(".tmp") or filename.endswith(".bak"): return
         
         # Debounce: If many events happen, we just set the flag, the loop handles it.
         print(f"[Watchdog] Change detected: {event.src_path}")
@@ -137,7 +137,7 @@ def scan_local_files():
         if ".git" in root: continue 
         
         for file in files:
-            if file in IGNORE_FILES: continue
+            if file in IGNORE_FILES or file.endswith(".tmp") or file.endswith(".bak"): continue
             
             path = os.path.join(root, file)
             rel_path = os.path.relpath(path, SYNC_DIR).replace("\\", "/")
@@ -280,17 +280,29 @@ def sync_with_peer(peer_url):
         print(f"Error syncing with {peer_url}: {e}")
 
 def download_and_save(peer_url, rel_path, dest_path, mtime):
-    """Downloads a file."""
+    """Downloads a file atomically to prevent partial reads."""
+    temp_path = dest_path + ".tmp"
     try:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        
+        # Download to .tmp file first
         with requests.get(f"{peer_url}/download/{rel_path}", stream=True) as r:
             r.raise_for_status()
-            with open(dest_path, 'wb') as f:
+            with open(temp_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=16384):
                     f.write(chunk)
-        os.utime(dest_path, (time.time(), mtime))
+        
+        # Apply timestamp to temp file
+        os.utime(temp_path, (time.time(), mtime))
+        
+        # Atomic Rename (Overwrite)
+        os.replace(temp_path, dest_path)
+        
     except Exception as e:
         print(f"Failed to download {rel_path}: {e}")
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except: pass
 
 def run_sync_loop():
     print(f"--- Sync Active on: {SYNC_DIR} ---")
