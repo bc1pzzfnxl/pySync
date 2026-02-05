@@ -1,5 +1,4 @@
 pysync.db
-
 .gitignore
-
 .env
+config.json
