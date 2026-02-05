@@ -225,7 +225,11 @@ def sync_with_peer(peer_url):
             timeout=5,
             headers={"X-Auth-Token": AUTH_TOKEN}
         )
-        if resp.status_code != 200: return
+        if resp.status_code == 403:
+            print(f"[!] Auth Error with {peer_url}: Invalid Token (Check config.json)")
+            return
+        if resp.status_code != 200: 
+            return
         remote_data = resp.json()
         
         remote_files = remote_data.get("files", {})

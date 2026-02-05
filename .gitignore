@@ -1,1 +1,5 @@
 pysync.db
+
+.gitignore
+
+.env
