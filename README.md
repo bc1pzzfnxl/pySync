@@ -47,7 +47,7 @@ Why build this instead of using Syncthing or OneDrive?
 
 1.  Clone the repository:
     ```bash
-    git clone https://github.com/your/repo.git pySync
+    git clone https://github.com/bc1pzzfnxl/pySync.git
     cd pySync
     ```
 
