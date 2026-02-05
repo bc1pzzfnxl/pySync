@@ -6,8 +6,11 @@ import hashlib
 import threading
 import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from concurrent.futures import ThreadPoolExecutor
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 
 # ================= CONFIGURATION LOADER =================
 
@@ -42,18 +45,26 @@ except json.JSONDecodeError:
 # State structure: {"files": {path: {mtime, hash}}, "tombstones": {path: timestamp}}
 LOCAL_STATE = {"files": {}, "tombstones": {}}
 STATE_LOCK = threading.Lock()
+# Event triggers sync immediately when set
+SYNC_EVENT = threading.Event()
 
 def load_state():
     global LOCAL_STATE
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                LOCAL_STATE = json.load(f)
-                # Ensure structure
+                content = f.read().strip()
+                if not content:
+                    LOCAL_STATE = {"files": {}, "tombstones": {}}
+                    return
+                LOCAL_STATE = json.loads(content)
+                
                 if "files" not in LOCAL_STATE: LOCAL_STATE["files"] = {}
                 if "tombstones" not in LOCAL_STATE: LOCAL_STATE["tombstones"] = {}
-        except Exception as e:
-            print(f"Error loading state: {e}")
+                
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[!] Warning: Could not load state ({e}). Starting with fresh state.")
+            LOCAL_STATE = {"files": {}, "tombstones": {}}
 
 def save_state():
     with STATE_LOCK:
@@ -65,6 +76,41 @@ def save_state():
 
 # Load state on startup
 load_state()
+
+# ================= WATCHDOG HANDLER =================
+
+class ChangeHandler(FileSystemEventHandler):
+    def on_any_event(self, event):
+        if event.is_directory: return
+        
+        filename = os.path.basename(event.src_path)
+        if filename in IGNORE_FILES: return
+        
+        # Debounce: If many events happen, we just set the flag, the loop handles it.
+        print(f"[Watchdog] Change detected: {event.src_path}")
+        SYNC_EVENT.set()
+        
+        # Determine if we should notify others immediately
+        # We start a background task to notify peers (limiting spam done in main loop logic if needed, 
+        # but here we just trigger local scan -> which triggers sync -> which could trigger notify?
+        # Actually, let's just trigger the local capability to sync, and let the sync loop decide to notify.)
+        # Ideally: Local change -> Notify Peers "Hey I changed" -> Peers pull from me.
+        
+        # For this implementation: We set SYNC_EVENT. The main loop will wake up, 
+        # scan local files (updating DB), then we should probably NOTIFY neighbors.
+        # But `run_sync_loop` pulls from neighbors.
+        # So we need a "Push Notification" that tells neighbors "Pull from me now".
+        
+        threading.Thread(target=notify_peers, daemon=True).start()
+
+def notify_peers():
+    """Tells all peers that I have updates."""
+    for peer in PEERS:
+        try:
+            url = peer if peer.startswith("http") else f"http://{peer}"
+            requests.post(f"{url}/notify", timeout=1)
+        except:
+            pass
 
 # ========================================================
 
@@ -98,7 +144,6 @@ def scan_local_files():
             
             try:
                 stat = os.stat(path)
-                # Optimization: Only re-hash if mtime changed or not in state
                 cached = LOCAL_STATE["files"].get(rel_path)
                 
                 if cached and cached["mtime"] == stat.st_mtime:
@@ -115,23 +160,20 @@ def scan_local_files():
                 pass
 
     with STATE_LOCK:
-        # 2. Detect Deletions (Files in State but NOT in Current Scan)
-        # But filter out files that are already tombstones to avoid refreshing timestamp unnecessarily
+        # 2. Detect Deletions
         for old_path in list(LOCAL_STATE["files"].keys()):
             if old_path not in current_files:
-                # IT'S GONE! Mark as deleted.
                 print(f"[-] Detected local deletion: {old_path}")
                 LOCAL_STATE["tombstones"][old_path] = time.time()
         
         # 3. Update State
         LOCAL_STATE["files"] = current_files
         
-        # Cleanup: Remove files from tombstones if they reappeared
         for new_path in current_files:
             if new_path in LOCAL_STATE["tombstones"]:
                 del LOCAL_STATE["tombstones"][new_path]
 
-        # Cleanup: Remove very old tombstones (e.g. > 30 days) to keep DB small
+        # Cleanup old tombstones (> 30 days)
         now = time.time()
         expired = [p for p, t in LOCAL_STATE["tombstones"].items() if now - t > 2592000]
         for p in expired:
@@ -144,19 +186,22 @@ def scan_local_files():
 
 @app.get("/index")
 def get_index():
-    """Returns the current state including files and tombstones."""
-    # Force a scan to ensure we are up to date before serving
     return scan_local_files()
 
 @app.get("/download/{file_path:path}")
 def download_file(file_path: str):
-    """Serves the requested file to the peer."""
     if ".." in file_path: raise HTTPException(403)
-    
     full_path = os.path.join(SYNC_DIR, file_path)
     if os.path.exists(full_path):
         return FileResponse(full_path)
     raise HTTPException(404)
+
+@app.post("/notify")
+def receive_notification(background_tasks: BackgroundTasks):
+    """Endpoint called by peers when they have changes."""
+    print("[!] Notification received from peer: Triggering Sync.")
+    SYNC_EVENT.set()
+    return {"status": "ok"}
 
 # --- CLIENT SIDE ---
 
@@ -165,7 +210,6 @@ def sync_with_peer(peer_url):
         if not peer_url.startswith("http"):
             peer_url = f"http://{peer_url}"
 
-        # 1. Download peer's index
         resp = requests.get(f"{peer_url}/index", timeout=5)
         if resp.status_code != 200: return
         remote_data = resp.json()
@@ -173,70 +217,62 @@ def sync_with_peer(peer_url):
         remote_files = remote_data.get("files", {})
         remote_tombstones = remote_data.get("tombstones", {})
 
-        # Refresh local view before comparing
         scan_local_files() 
-        
         local_files = LOCAL_STATE["files"] 
 
-        # 2. Process Deletions (Tombstones) FIRST
+        # 2. Process Deletions
         for path, del_time in remote_tombstones.items():
             full_path = os.path.join(SYNC_DIR, path)
-            
-            # If we have this file, check if we should delete it
             if path in local_files:
-                local_mtime = local_files[path]["mtime"]
-                
-                # If deletion happened AFTER our last edit -> DELETE IT
-                if del_time > local_mtime:
+                if del_time > local_files[path]["mtime"]:
                     print(f"[-] Applying remote deletion: {path}")
                     try:
-                        if os.path.exists(full_path):
-                            os.remove(full_path)
-                        # Remove from our local state immediately
+                        if os.path.exists(full_path): os.remove(full_path)
                         with STATE_LOCK:
-                            if path in LOCAL_STATE["files"]:
-                                del LOCAL_STATE["files"][path]
-                            LOCAL_STATE["tombstones"][path] = del_time # Adopt the tombstone
-                    except OSError as e:
-                        print(f"Error deleting {path}: {e}")
+                            if path in LOCAL_STATE["files"]: del LOCAL_STATE["files"][path]
+                            LOCAL_STATE["tombstones"][path] = del_time
+                    except OSError: pass
 
-        # 3. Process Updates / Downloads
+        # 3. Process Updates / Downloads (PARALLELIZED)
+        downloads = [] # List of (rel_path, r_meta, full_path)
+
         for rel_path, r_meta in remote_files.items():
             full_path = os.path.join(SYNC_DIR, rel_path)
             
-            # CASE A: New file (I don't have it and it's NOT a tombstone locally)
+            # CASE A: New file
             if rel_path not in local_files:
-                # Check if I previously deleted it (Tombstone check)
                 my_del_time = LOCAL_STATE["tombstones"].get(rel_path, 0)
-                
                 if r_meta['mtime'] > my_del_time:
-                    # It's newer than my deletion (or I never deleted it) -> Download
-                    print(f"[+] Downloading new file: {rel_path}")
-                    download_and_save(peer_url, rel_path, full_path, r_meta['mtime'])
-                
+                    print(f"[+] Queueing new file: {rel_path}")
+                    downloads.append((rel_path, r_meta, full_path))
                 continue
 
-            # CASE B: I have it
+            # CASE B: Update / Conflict
             local_meta = local_files[rel_path]
-            
-            if local_meta['hash'] == r_meta['hash']:
-                continue # Identical
+            if local_meta['hash'] == r_meta['hash']: continue
 
-            # CASE C: Conflict / Update
-            if r_meta['mtime'] > local_meta['mtime'] + 2: # Tolerance
-                print(f"[^] Updating: {rel_path}")
-                download_and_save(peer_url, rel_path, full_path, r_meta['mtime'])
+            if r_meta['mtime'] > local_meta['mtime'] + 2:
+                print(f"[^] Queueing update: {rel_path}")
+                downloads.append((rel_path, r_meta, full_path))
             
             elif local_meta['hash'] != r_meta['hash']:
-                # Conflict logic same as before...
-                # Simpler: if hashes differ and times are close, just backup mine and take theirs
                 print(f"[!] CONFLICT on {rel_path} -> Backing up")
                 conflict_name = f"{full_path}.conflict-{MY_ID}-{int(time.time())}.bak"
                 try:
                     os.rename(full_path, conflict_name)
-                    download_and_save(peer_url, rel_path, full_path, r_meta['mtime'])
-                except OSError:
-                    pass
+                    downloads.append((rel_path, r_meta, full_path))
+                except OSError: pass
+
+        # Execute downloads in parallel
+        if downloads:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                # We map the download function to the list of items
+                # We need a helper to unpack arguments
+                futures = [
+                    executor.submit(download_and_save, peer_url, item[0], item[2], item[1]['mtime']) 
+                    for item in downloads
+                ]
+                for f in futures: f.result() # Wait for all to finish
 
     except requests.exceptions.ConnectionError:
         pass
@@ -244,35 +280,42 @@ def sync_with_peer(peer_url):
         print(f"Error syncing with {peer_url}: {e}")
 
 def download_and_save(peer_url, rel_path, dest_path, mtime):
-    """Downloads a file and forces its modification time to match the source."""
+    """Downloads a file."""
     try:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        
         with requests.get(f"{peer_url}/download/{rel_path}", stream=True) as r:
             r.raise_for_status()
             with open(dest_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=16384):
                     f.write(chunk)
-                    
         os.utime(dest_path, (time.time(), mtime))
-        # Update state immediately after download to prevent re-download loop
-        with STATE_LOCK:
-             # Re-hash (or trust remote hash? trusting is faster but risky if corruption)
-             # Let's trust for speed but next scan will verify
-             pass 
-
     except Exception as e:
         print(f"Failed to download {rel_path}: {e}")
 
 def run_sync_loop():
     print(f"--- Sync Active on: {SYNC_DIR} ---")
-    while True:
-        # Periodically save state
-        scan_local_files()
-        
-        for peer in PEERS:
-            sync_with_peer(peer)
-        time.sleep(15)
+    
+    # Start Watchdog
+    event_handler = ChangeHandler()
+    observer = Observer()
+    observer.schedule(event_handler, SYNC_DIR, recursive=True)
+    observer.start()
+    
+    try:
+        while True:
+            # Sync immediately
+            scan_local_files()
+            for peer in PEERS:
+                sync_with_peer(peer)
+            
+            # Wait for event OR timeout (every 60s fallback instead of 15s)
+            # If watchdog triggers, SYNC_EVENT is set, wait returns True immediately
+            SYNC_EVENT.wait(timeout=60)
+            SYNC_EVENT.clear()
+            
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_sync_loop, daemon=True)
