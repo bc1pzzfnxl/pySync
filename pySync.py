@@ -251,6 +251,11 @@ def sync_with_peer(peer_url):
             local_meta = local_files[rel_path]
             if local_meta['hash'] == r_meta['hash']: continue
 
+            # If Local is NEWER than Remote (by a margin), DO NOT touch it.
+            # The remote peer will download it from us when it syncs.
+            if local_meta['mtime'] > r_meta['mtime'] + 1:
+                continue
+
             if r_meta['mtime'] > local_meta['mtime'] + 2:
                 print(f"[^] Queueing update: {rel_path}")
                 downloads.append((rel_path, r_meta, full_path))
