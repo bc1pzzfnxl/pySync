@@ -9,7 +9,7 @@ import uvicorn
 from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.responses import FileResponse, JSONResponse
 
 # ================= CONFIGURATION LOADER =================
@@ -26,9 +26,14 @@ try:
         
     SYNC_DIR = config["sync_dir"]
     PEERS = config["peers"]
-    
+    AUTH_TOKEN = config.get("auth_token")
+
     if not os.path.exists(SYNC_DIR):
         print(f"ERROR: The directory {SYNC_DIR} does not exist.")
+        sys.exit(1)
+    
+    if not AUTH_TOKEN:
+        print(f"ERROR: 'auth_token' is missing in {CONFIG_FILE}. Please add it.")
         sys.exit(1)
         
     print(f"Configuration loaded. Syncing: {SYNC_DIR}")
@@ -47,6 +52,7 @@ LOCAL_STATE = {"files": {}, "tombstones": {}}
 STATE_LOCK = threading.Lock()
 # Event triggers sync immediately when set
 SYNC_EVENT = threading.Event()
+LAST_NOTIFY = 0
 
 def load_state():
     global LOCAL_STATE
@@ -86,20 +92,16 @@ class ChangeHandler(FileSystemEventHandler):
         filename = os.path.basename(event.src_path)
         if filename in IGNORE_FILES or filename.endswith(".tmp") or filename.endswith(".bak"): return
         
-        # Debounce: If many events happen, we just set the flag, the loop handles it.
         print(f"[Watchdog] Change detected: {event.src_path}")
         SYNC_EVENT.set()
         
-        # Determine if we should notify others immediately
-        # We start a background task to notify peers (limiting spam done in main loop logic if needed, 
-        # but here we just trigger local scan -> which triggers sync -> which could trigger notify?
-        # Actually, let's just trigger the local capability to sync, and let the sync loop decide to notify.)
-        # Ideally: Local change -> Notify Peers "Hey I changed" -> Peers pull from me.
-        
-        # For this implementation: We set SYNC_EVENT. The main loop will wake up, 
-        # scan local files (updating DB), then we should probably NOTIFY neighbors.
-        # But `run_sync_loop` pulls from neighbors.
-        # So we need a "Push Notification" that tells neighbors "Pull from me now".
+        # Debounce network notification (Limit to 1 per 2 seconds)
+        global LAST_NOTIFY
+        with STATE_LOCK:
+            now = time.time()
+            if now - LAST_NOTIFY < 2:
+                return
+            LAST_NOTIFY = now
         
         threading.Thread(target=notify_peers, daemon=True).start()
 
@@ -108,14 +110,22 @@ def notify_peers():
     for peer in PEERS:
         try:
             url = peer if peer.startswith("http") else f"http://{peer}"
-            requests.post(f"{url}/notify", timeout=1)
+            requests.post(
+                f"{url}/notify", 
+                timeout=1,
+                headers={"X-Auth-Token": AUTH_TOKEN}
+            )
         except:
             pass
 
-# ========================================================
+# ================= SERVER & AUTH =================
 
 MY_ID = os.environ.get("COMPUTERNAME", os.environ.get("HOSTNAME", "PC_UNKNOWN"))
 app = FastAPI()
+
+async def verify_token(x_auth_token: str = Header(...)):
+    if x_auth_token != AUTH_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid Auth Token")
 
 def calculate_hash(filepath):
     """Calculates MD5 checksum to verify exact content."""
@@ -182,13 +192,13 @@ def scan_local_files():
     save_state()
     return LOCAL_STATE
 
-# --- SERVER SIDE ---
+# --- ENDPOINTS ---
 
-@app.get("/index")
+@app.get("/index", dependencies=[Depends(verify_token)])
 def get_index():
     return scan_local_files()
 
-@app.get("/download/{file_path:path}")
+@app.get("/download/{file_path:path}", dependencies=[Depends(verify_token)])
 def download_file(file_path: str):
     if ".." in file_path: raise HTTPException(403)
     full_path = os.path.join(SYNC_DIR, file_path)
@@ -196,7 +206,7 @@ def download_file(file_path: str):
         return FileResponse(full_path)
     raise HTTPException(404)
 
-@app.post("/notify")
+@app.post("/notify", dependencies=[Depends(verify_token)])
 def receive_notification(background_tasks: BackgroundTasks):
     """Endpoint called by peers when they have changes."""
     print("[!] Notification received from peer: Triggering Sync.")
@@ -210,7 +220,11 @@ def sync_with_peer(peer_url):
         if not peer_url.startswith("http"):
             peer_url = f"http://{peer_url}"
 
-        resp = requests.get(f"{peer_url}/index", timeout=5)
+        resp = requests.get(
+            f"{peer_url}/index", 
+            timeout=5,
+            headers={"X-Auth-Token": AUTH_TOKEN}
+        )
         if resp.status_code != 200: return
         remote_data = resp.json()
         
@@ -291,7 +305,11 @@ def download_and_save(peer_url, rel_path, dest_path, mtime):
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         
         # Download to .tmp file first
-        with requests.get(f"{peer_url}/download/{rel_path}", stream=True) as r:
+        with requests.get(
+            f"{peer_url}/download/{rel_path}", 
+            stream=True,
+            headers={"X-Auth-Token": AUTH_TOKEN}
+        ) as r:
             r.raise_for_status()
             with open(temp_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=16384):
