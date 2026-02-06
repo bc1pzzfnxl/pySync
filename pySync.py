@@ -14,36 +14,35 @@ from fastapi.responses import FileResponse, JSONResponse
 
 # ================= CONFIGURATION LOADER =================
 
-CONFIG_FILE = "config.json"
+import argparse
+
+# ================= CONFIGURATION LOADER =================
+
 STATE_FILE = "pysync.db"
 PORT = 7777
 # Files to strictly ignore
-IGNORE_FILES = ["workspace.json", ".DS_Store", "desktop.ini", STATE_FILE, CONFIG_FILE, ".git"]
+IGNORE_FILES = ["workspace.json", ".DS_Store", "desktop.ini", STATE_FILE, ".git"]
 
-try:
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
-        
-    SYNC_DIR = config["sync_dir"]
-    PEERS = config["peers"]
-    AUTH_TOKEN = config.get("auth_token")
+# Parse Arguments
+parser = argparse.ArgumentParser(description="pySync: Peer-to-Peer File Synchronization")
+parser.add_argument("-d", "--directory", required=True, help="Directory to synchronize")
+parser.add_argument("-t", "--target", action="append", required=True, help="Target peer IPs (e.g. 192.168.1.5:7777). Can be used multiple times.")
+parser.add_argument("-p", "--password", required=True, help="Authentication token/password")
 
-    if not os.path.exists(SYNC_DIR):
-        print(f"ERROR: The directory {SYNC_DIR} does not exist.")
-        sys.exit(1)
-    
-    if not AUTH_TOKEN:
-        print(f"ERROR: 'auth_token' is missing in {CONFIG_FILE}. Please add it.")
-        sys.exit(1)
-        
-    print(f"Configuration loaded. Syncing: {SYNC_DIR}")
-    
-except FileNotFoundError:
-    print(f"ERROR: {CONFIG_FILE} not found. Please create it.")
+args = parser.parse_args()
+
+SYNC_DIR = os.path.abspath(args.directory)
+PEERS = args.target
+AUTH_TOKEN = args.password
+
+if not os.path.exists(SYNC_DIR):
+    print(f"ERROR: The directory {SYNC_DIR} does not exist.")
     sys.exit(1)
-except json.JSONDecodeError:
-    print(f"ERROR: {CONFIG_FILE} is not a valid JSON file.")
-    sys.exit(1)
+
+print(f"--- Config Loaded ---")
+print(f"Sync Directory: {SYNC_DIR}")
+print(f"Peers: {PEERS}")
+print(f"---------------------")
 
 # ================= STATE MANAGEMENT =================
 

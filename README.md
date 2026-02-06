@@ -56,75 +56,27 @@ Why build this instead of using Syncthing or OneDrive?
     pip install -r requirements.txt
     ```
 
-3.  Configure `config.json` (See section below).
+## 💻 Usage
 
-4.  Run:
-    ```bash
-    python pySync.py
-    ```
+Run the script directly via Command Line. No configuration file needed!
 
-## ⚙️ Configuration
-
-Create a `config.json` file in the root directory:
-
-```json
-{
-    "sync_dir": "C:/Users/You/Documents/ObsidianVault",
-    "peers": [
-        "100.x.y.z:7777",
-        "100.a.b.c:7777"
-    ],
-    "auth_token": "YourSuperSecretPassword"
-}
+```bash
+python pySync.py -d "C:/My/Folder" -t "IP_PEER1:7777" -t "IP_PEER2:7777" -p "MySecretPassword"
 ```
-*   **sync_dir**: Absolute path to the folder you want to sync.
-*   **peers**: List of `IP:Port` of your other machines (Tailscale IPs recommended).
-*   **auth_token**: A master password shared across all your devices.
 
----
+### Arguments:
+*   `-d`, `--directory`: Path to the folder you want to sync (Absolute path recommended).
+*   `-t`, `--target`: IP:Port of a peer. Can be used multiple times for multiple peers.
+*   `-p`, `--password`: Shared secret for authentication.
 
-# 🚢 Deployment Guide
+### Example
 
-How to run `pySync` as a background service.
+**Machine A (10.0.0.1)** syncs `C:\Docs`:
+```bash
+python pySync.py -d "C:\Docs" -t "10.0.0.2:7777" -p "s3cr3t"
+```
 
-## 🐧 Linux (Raspberry Pi / Debian)
-
-1.  **Edit** `deployment/pysync.service`:
-    *   Change `User=pi` to your username.
-    *   Change `WorkingDirectory` and `ExecStart` to match your installation path.
-
-2.  **Install & Enable**:
-    ```bash
-    sudo cp deployment/pysync.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    sudo systemctl enable pysync
-    sudo systemctl start pysync
-    ```
-
-3.  **Check Status**:
-    ```bash
-    systemctl status pysync
-    journalctl -u pysync -f  # View logs
-    ```
-
-## 🪟 Windows
-
-### Option 1: Startup Folder (Easiest)
-1.  **Edit** `deployment/windows_startup.bat`:
-    *   Update the path `cd /d "..."` to your folder.
-2.  Press `Win + R`, type `shell:startup` and press Enter.
-3.  Copy `windows_startup.bat` into this folder.
-4.  It will start continuously in the background on next login.
-
-### Option 2: Windows Service (Robust)
-For a true service (starts before login), use **NSSM** (Non-Sucking Service Manager).
-1.  Download [NSSM](https://nssm.cc/download).
-2.  Run generic command line as Admin:
-    ```powershell
-    nssm install PySync
-    ```
-3.  In the GUI:
-    *   **Path**: Path to your `python.exe`
-    *   **Startup Directory**: Path to `pySync` folder
-    *   **Arguments**: `pySync.py`
-4.  Click "Install Service".
+**Machine B (10.0.0.2)** syncs `/home/user/docs`:
+```bash
+python pySync.py -d "/home/user/docs" -t "10.0.0.1:7777" -p "s3cr3t"
+```
